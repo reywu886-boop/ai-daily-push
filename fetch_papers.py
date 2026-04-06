@@ -1,7 +1,7 @@
 """
 AI 日报 - 论文抓取模块
 从 Hugging Face Daily Papers 和 Papers With Code 抓取当日最新论文
-支持中文翻译 + 产品经理视角解读
+支持 Kimi LLM 深度解读 + 中文翻译
 """
 
 import requests
@@ -12,8 +12,7 @@ import re
 import time
 import sys
 import io
-import hashlib
-import urllib.parse
+import os
 
 # 修复 Windows 终端编码
 if sys.stdout.encoding != 'utf-8':
@@ -298,137 +297,218 @@ def classify_paper(paper):
     return "📄 其他方向"
 
 
-def translate_to_chinese(text, max_retries=2):
-    """使用 Google Translate 免费接口翻译英文到中文"""
-    if not text or len(text.strip()) < 5:
-        return text
-    
-    # 截断过长文本
-    if len(text) > 3000:
-        text = text[:3000] + "..."
+def fetch_arxiv_html_content(arxiv_id, max_retries=2):
+    """
+    尝试从 arXiv HTML 版本获取论文正文的前几段（引言部分）
+    这样可以给 LLM 更多上下文来生成深度解读
+    """
+    html_url = f"https://arxiv.org/html/{arxiv_id}v1"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
     
     for attempt in range(max_retries + 1):
         try:
-            url = "https://translate.googleapis.com/translate_a/single"
-            params = {
-                "client": "gtx",
-                "sl": "en",
-                "tl": "zh-CN",
-                "dt": "t",
-                "q": text,
-            }
-            resp = requests.get(url, params=params, timeout=15)
-            resp.raise_for_status()
-            result = resp.json()
-            # 拼接翻译结果
-            translated = "".join(item[0] for item in result[0] if item[0])
-            return translated
+            resp = requests.get(html_url, headers=headers, timeout=30)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                
+                # 提取正文段落（引言和方法部分）
+                paragraphs = []
+                for section in soup.find_all(["section", "div"]):
+                    # 找到 Introduction 或前几个 section
+                    heading = section.find(["h2", "h3", "h4"])
+                    if heading:
+                        heading_text = heading.get_text(strip=True).lower()
+                        if any(kw in heading_text for kw in 
+                               ["introduction", "related", "method", "approach", "overview"]):
+                            for p in section.find_all("p"):
+                                text = p.get_text(strip=True)
+                                if len(text) > 50:
+                                    paragraphs.append(text)
+                                if len(paragraphs) >= 6:
+                                    break
+                    if len(paragraphs) >= 6:
+                        break
+                
+                # 如果没找到 section，直接取前面的段落
+                if not paragraphs:
+                    for p in soup.find_all("p"):
+                        text = p.get_text(strip=True)
+                        if len(text) > 80:
+                            paragraphs.append(text)
+                        if len(paragraphs) >= 5:
+                            break
+                
+                if paragraphs:
+                    content = "\n\n".join(paragraphs)
+                    # 限制长度，避免 token 过多
+                    if len(content) > 4000:
+                        content = content[:4000] + "..."
+                    return content
+            
+            return None
+            
         except Exception as e:
             if attempt < max_retries:
-                time.sleep(1)
+                time.sleep(2)
             else:
-                print(f"[WARN] 翻译失败: {e}")
+                print(f"    [WARN] arXiv HTML 获取失败 {arxiv_id}: {e}")
                 return None
     return None
 
 
-def generate_pm_insight(paper):
-    """
-    为 AI 产品经理生成论文核心解读
-    基于论文标题、摘要、分类等信息，用通俗语言解释：
-    1. 这篇论文解决了什么问题
-    2. 核心方法/思路是什么
-    3. 对产品/行业有什么启示
-    """
-    title = paper.get("title", "").lower()
-    abstract = paper.get("abstract", "")
-    abstract_lower = abstract.lower()
-    categories = paper.get("categories", [])
+# ---- Kimi LLM 深度解读 ----
+
+KIMI_API_KEY = os.environ.get("KIMI_API_KEY", "")
+KIMI_MODEL = "moonshot-v1-32k"
+KIMI_API_URL = "https://api.moonshot.cn/v1/chat/completions"
+
+ANALYSIS_PROMPT = """你是一位资深的 AI 行业分析师，你的读者是一位非技术出身但长期深度关注 AI 领域的产品经理。
+她对 Transformer、Diffusion、RLHF、RAG、Agent、LoRA 等常见概念已有基本了解，不需要从零解释这些术语，但需要你在用到更细分的技术概念时做简短说明。
+
+请阅读以下论文信息，然后写一份解读报告。
+
+要求：
+1. 先给出论文标题的中文翻译
+2. 用一句话概括这篇论文在做什么（不超过30字）
+3. 写 3-5 段的深度解读，包括：
+   - **研究背景**：这篇论文要解决的是什么问题？为什么这个问题重要？当前方案的痛点在哪？
+   - **核心方法**：论文提出了什么新方法/框架/思路？用通俗但准确的语言解释其核心创新点。如果涉及新概念，用类比或例子帮助理解。
+   - **关键结果**：论文取得了什么效果？和现有方案相比提升了多少？有没有开源？
+   - **产品经理视角**：这项研究对 AI 产品（尤其是视频生成、多模态、Agent、内容创作等方向）有什么启示？是否有近期产品化的可能？对竞品格局有何影响？
+4. 语气：专业但不晦涩，像同事之间讨论技术趋势，不要用"本文"这种论文腔
+
+格式要求（严格遵守）：
+📌 **中文标题**：xxx
+💡 **一句话概括**：xxx
+
+**研究背景**
+xxx
+
+**核心方法**
+xxx
+
+**关键结果**
+xxx
+
+**产品启示**
+xxx
+"""
+
+
+def call_kimi_api(prompt, content, max_retries=2):
+    """调用 Kimi API 生成内容"""
+    if not KIMI_API_KEY:
+        return None
     
-    # ---- 提取关键信号 ----
-    signals = []
-    
-    # 问题类型识别
-    problem_patterns = {
-        "benchmark|evaluat|assessment": "提出了新的评测基准",
-        "generat|synthes|creat": "关于内容生成技术",
-        "edit|manipulat|transform": "关于内容编辑/操控技术",
-        "understand|recogni|detect|perceiv": "关于AI理解/识别能力",
-        "accelerat|efficien|fast|compress|lightweight": "关于提升模型效率",
-        "safe|align|bias|toxic|hallucin": "关于AI安全与可靠性",
-        "agent|tool.use|planning|reasoning": "关于AI Agent自主能力",
-        "retriev|rag|knowledge|ground": "关于知识检索增强",
-        "train|fine.tun|pretrain|reinforc": "关于模型训练方法",
-        "multi.modal|vision.language|cross.modal": "关于多模态能力",
-        "video|temporal|motion|dynamic": "关于视频/动态内容",
-        "3d|spatial|scene|reconstruct|nerf|gaussian": "关于3D/空间理解",
-        "diffusion|denois|score.match": "基于扩散模型技术",
-        "robot|embod|navigation|manipulat": "关于具身智能/机器人",
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {KIMI_API_KEY}",
     }
     
-    for pattern, desc in problem_patterns.items():
-        if re.search(pattern, title + " " + abstract_lower):
-            signals.append(desc)
+    payload = {
+        "model": KIMI_MODEL,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": content},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 2000,
+    }
     
-    # ---- 构建解读 ----
-    insight_parts = []
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(
+                KIMI_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            if attempt < max_retries:
+                wait = 5 * (attempt + 1)
+                print(f"    [WARN] Kimi API 调用失败，{wait}s 后重试: {e}")
+                time.sleep(wait)
+            else:
+                print(f"    [ERROR] Kimi API 调用最终失败: {e}")
+                return None
+    return None
+
+
+def generate_deep_analysis(paper):
+    """
+    用 Kimi LLM 为论文生成深度解读报告
+    会尝试获取论文正文（HTML版）来提供更丰富的上下文
+    """
+    title = paper.get("title", "")
+    abstract = paper.get("abstract", "")
+    authors = paper.get("authors", "")
+    institutions = paper.get("institutions", "")
+    arxiv_id = paper.get("arxiv_id", "")
+    categories = paper.get("categories", [])
     
-    # 解决什么问题
-    if abstract:
-        # 提取第一句作为问题描述
-        first_sentences = re.split(r'(?<=[.!?])\s+', abstract)
-        if first_sentences:
-            problem_sentence = first_sentences[0]
-            insight_parts.append(f"**解决的问题**：{problem_sentence}")
+    if not abstract:
+        return None
     
-    # 核心思路（从摘要中提取 "we propose/introduce/present" 后面的内容）
-    approach_patterns = [
-        r'[Ww]e (?:propose|introduce|present|develop|design)\s+(.{30,200}?)(?:\.|,\s*which)',
-        r'[Tt]his (?:paper|work|study) (?:proposes|introduces|presents)\s+(.{30,200}?)(?:\.|,\s*which)',
-        r'[Oo]ur (?:method|approach|framework|system|model),?\s+(?:called|named|dubbed)?\s*\w*,?\s*(.{30,200}?)(?:\.|,\s*which)',
-    ]
+    # 尝试获取论文正文（引言部分）
+    extra_content = ""
+    if arxiv_id:
+        print(f"    → 尝试获取论文正文...")
+        html_content = fetch_arxiv_html_content(arxiv_id)
+        if html_content:
+            extra_content = f"\n\n--- 论文正文节选（引言/方法）---\n{html_content}"
+            print(f"    ✓ 获取到正文 {len(html_content)} 字符")
+        else:
+            print(f"    → 无 HTML 版本，使用摘要")
     
-    approach_found = False
-    for pat in approach_patterns:
-        match = re.search(pat, abstract)
-        if match:
-            insight_parts.append(f"**核心思路**：{match.group(1).strip()}")
-            approach_found = True
-            break
+    # 构建输入
+    user_input = f"""论文标题：{title}
+作者：{authors}
+机构：{institutions}
+分类：{', '.join(categories) if categories else 'N/A'}
+arXiv ID：{arxiv_id}
+
+摘要（Abstract）：
+{abstract}{extra_content}"""
+
+    print(f"    → 调用 Kimi 生成深度解读...")
+    analysis = call_kimi_api(ANALYSIS_PROMPT, user_input)
     
-    if not approach_found and len(signals) > 0:
-        insight_parts.append(f"**技术方向**：{'; '.join(signals[:3])}")
+    if analysis:
+        print(f"    ✓ 解读生成完成（{len(analysis)} 字符）")
     
-    # 产品启示
-    pm_angles = []
+    return analysis
+
+
+def generate_fallback_analysis(paper):
+    """当 Kimi API 不可用时的备用解读（简化版翻译+摘要）"""
+    title = paper.get("title", "")
+    abstract = paper.get("abstract", "")
     
-    if any(kw in abstract_lower for kw in ["video generat", "video edit", "video diffus"]):
-        pm_angles.append("视频生成/编辑类产品可关注此方向的技术进展，评估是否可用于自动化视频制作流程")
-    if any(kw in abstract_lower for kw in ["multimodal", "vision-language", "image-text"]):
-        pm_angles.append("多模态技术的突破意味着产品可以更好地理解图文混合内容，提升搜索、推荐和内容审核能力")
-    if any(kw in abstract_lower for kw in ["agent", "tool use", "planning"]):
-        pm_angles.append("Agent 能力的增强意味着 AI 助手可以完成更复杂的多步骤任务，减少人工干预")
-    if any(kw in abstract_lower for kw in ["efficien", "fast", "lightweight", "compress"]):
-        pm_angles.append("效率提升意味着更低的推理成本和更快的响应速度，有助于降低产品运营成本")
-    if any(kw in abstract_lower for kw in ["safe", "alignment", "hallucin", "bias"]):
-        pm_angles.append("安全与对齐研究直接关系到产品的可靠性和合规性，是落地应用的关键保障")
-    if any(kw in abstract_lower for kw in ["benchmark", "evaluat"]):
-        pm_angles.append("新的评测基准有助于选型时量化比较不同模型的能力，为技术选型提供依据")
-    if any(kw in abstract_lower for kw in ["rag", "retriev", "knowledge"]):
-        pm_angles.append("检索增强技术可直接应用于知识库问答、文档分析等企业级 AI 产品")
-    if any(kw in abstract_lower for kw in ["3d", "gaussian", "nerf", "scene"]):
-        pm_angles.append("3D 技术进展可关注在数字人、虚拟场景、游戏内容自动生成等方向的产品化机会")
-    if any(kw in abstract_lower for kw in ["robot", "embod", "navigation"]):
-        pm_angles.append("具身智能研究推动机器人从实验室走向产品化，关注人机交互和场景适配")
-    if any(kw in abstract_lower for kw in ["diffusion", "image generat"]):
-        pm_angles.append("图像生成技术持续迭代，关注生成质量、可控性和商业化落地场景")
+    if not abstract:
+        return "暂无摘要信息。"
     
-    if not pm_angles:
-        pm_angles.append("该研究展示了 AI 前沿技术的新进展，可持续关注其后续开源和应用落地情况")
-    
-    insight_parts.append(f"**产品启示**：{pm_angles[0]}")
-    
-    return "\n".join(insight_parts)
+    # 用 Google Translate 做基础翻译
+    try:
+        url = "https://translate.googleapis.com/translate_a/single"
+        # 翻译标题
+        params = {"client": "gtx", "sl": "en", "tl": "zh-CN", "dt": "t", "q": title}
+        resp = requests.get(url, params=params, timeout=15)
+        title_zh = "".join(item[0] for item in resp.json()[0] if item[0])
+        
+        # 翻译摘要
+        short_abstract = abstract[:1500]
+        params["q"] = short_abstract
+        resp = requests.get(url, params=params, timeout=15)
+        abstract_zh = "".join(item[0] for item in resp.json()[0] if item[0])
+        
+        return f"📌 **中文标题**：{title_zh}\n\n**摘要翻译**：{abstract_zh}\n\n*（注：LLM 深度解读暂不可用，显示翻译版摘要）*"
+    except Exception:
+        return f"摘要：{abstract[:500]}..."
 
 
 def format_papers_report(papers, max_papers=10):
@@ -458,7 +538,11 @@ def format_papers_report(papers, max_papers=10):
     lines = []
     idx = 1
     
-    print("  → 开始翻译论文标题和摘要...")
+    has_kimi = bool(KIMI_API_KEY)
+    if has_kimi:
+        print("  → Kimi API 可用，将生成深度解读...")
+    else:
+        print("  → [WARN] 未配置 KIMI_API_KEY，使用备用翻译模式")
     
     for cat in priority:
         if cat not in categorized:
@@ -476,52 +560,48 @@ def format_papers_report(papers, max_papers=10):
             likes = p.get("likes", 0)
             arxiv_id = p.get("arxiv_id", "")
             
-            # 翻译标题
-            title_zh = translate_to_chinese(title)
-            if title_zh and title_zh != title:
-                lines.append(f"**{idx}. {title}**")
-                lines.append(f"**📌 {title_zh}**")
-            else:
-                lines.append(f"**{idx}. {title}**")
+            print(f"\n  📄 处理论文 {idx}: {title[:60]}...")
             
+            # 标题
+            lines.append(f"**{idx}. {title}**")
+            
+            # 作者和机构
             author_line = f"- **作者**：{authors}"
             if institutions:
                 author_line += f" | **机构**：{institutions}"
             lines.append(author_line)
             
-            if abstract:
-                # 英文摘要（取前3句）
-                sentences = re.split(r'(?<=[.!?])\s+', abstract)
-                summary_en = " ".join(sentences[:3])
-                if len(summary_en) > 400:
-                    summary_en = summary_en[:400] + "..."
-                lines.append(f"- **摘要**：{summary_en}")
+            # 深度解读（核心改动）
+            if has_kimi and abstract:
+                analysis = generate_deep_analysis(p)
+                if analysis:
+                    lines.append("")
+                    lines.append(analysis)
+                    lines.append("")
+                else:
+                    # Kimi 失败，用备用方案
+                    fallback = generate_fallback_analysis(p)
+                    lines.append(f"\n{fallback}\n")
                 
-                # 中文翻译摘要
-                abstract_zh = translate_to_chinese(summary_en)
-                if abstract_zh:
-                    lines.append(f"- **中文摘要**：{abstract_zh}")
-                
-                time.sleep(0.5)  # 翻译 API 间隔
+                # 控制 API 调用频率
+                time.sleep(2)
+            elif abstract:
+                fallback = generate_fallback_analysis(p)
+                lines.append(f"\n{fallback}\n")
             
-            # 产品经理解读
-            pm_insight = generate_pm_insight(p)
-            if pm_insight:
-                lines.append(f"- 💡 **PM 解读**：")
-                for insight_line in pm_insight.split("\n"):
-                    lines.append(f"  - {insight_line}")
-            
+            # 链接
             if link:
-                lines.append(f"- **链接**：{link}")
+                lines.append(f"- 🔗 **论文链接**：{link}")
             elif arxiv_id:
-                lines.append(f"- **链接**：https://arxiv.org/abs/{arxiv_id}")
+                lines.append(f"- 🔗 **论文链接**：https://arxiv.org/abs/{arxiv_id}")
             
             if likes:
                 lines.append(f"- 🔥 {likes} 赞")
             
             lines.append("")
+            lines.append("---")
+            lines.append("")
             idx += 1
-            print(f"    ✓ 论文 {idx-1} 翻译+解读完成")
     
     return "\n".join(lines)
 
