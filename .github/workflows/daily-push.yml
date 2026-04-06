@@ -1,0 +1,45 @@
+name: AI Daily Push
+
+on:
+  schedule:
+    # 每天 UTC 0:00 运行 = 北京时间 08:00
+    - cron: '0 0 * * *'
+  workflow_dispatch:  # 允许手动触发（测试用）
+
+jobs:
+  daily-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run AI Daily Push
+        env:
+          # 发件邮箱配置（在 GitHub Settings → Secrets 中设置）
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          # 可选：Serper API Key（增强新闻搜索）
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+        run: python main.py
+
+      - name: Upload report as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-report-${{ github.run_number }}
+          path: daily_report.md
+          retention-days: 30
