@@ -1,6 +1,7 @@
 """
 AI 日报 - 热点新闻抓取模块
 从多个来源抓取当日 AI 行业热点事件
+支持 Kimi LLM 中文翻译
 """
 
 import requests
@@ -11,6 +12,7 @@ import json
 import time
 import sys
 import io
+import os
 
 # 修复 Windows 终端编码
 if sys.stdout.encoding != 'utf-8':
@@ -260,8 +262,104 @@ def score_news(item):
     return score
 
 
+# ---- Kimi 新闻翻译 ----
+
+KIMI_API_KEY = os.environ.get("KIMI_API_KEY", "")
+KIMI_MODEL = "moonshot-v1-32k"
+KIMI_API_URL = "https://api.moonshot.cn/v1/chat/completions"
+
+NEWS_TRANSLATE_PROMPT = """你是一位专业的科技新闻翻译和编辑。请将以下英文 AI 新闻翻译成中文。
+
+要求：
+1. 翻译要准确、流畅，符合中文科技新闻的行文风格
+2. 公司名称保留英文（如 OpenAI、Google、Meta 等）
+3. 专业术语可以中英对照（如 "大语言模型（LLM）"）
+4. 如果描述太长，请精简到 2-3 句话的核心信息
+5. 在翻译后，用一句话补充说明这条新闻对 AI 行业/产品的影响意义（以"💡 "开头）
+
+请严格按以下格式输出每条新闻，用 "---" 分隔：
+中文标题：xxx
+中文描述：xxx
+💡 xxx
+---
+"""
+
+
+def translate_news_batch(news_items, max_retries=2):
+    """用 Kimi 批量翻译新闻标题和描述"""
+    if not KIMI_API_KEY or not news_items:
+        return news_items
+    
+    # 构建输入
+    input_parts = []
+    for i, item in enumerate(news_items, 1):
+        title = item.get("title", "")
+        desc = item.get("description", "")
+        input_parts.append(f"新闻 {i}:\nTitle: {title}\nDescription: {desc}")
+    
+    user_input = "\n\n".join(input_parts)
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {KIMI_API_KEY}",
+    }
+    
+    payload = {
+        "model": KIMI_MODEL,
+        "messages": [
+            {"role": "system", "content": NEWS_TRANSLATE_PROMPT},
+            {"role": "user", "content": user_input},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 3000,
+    }
+    
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(
+                KIMI_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            result_text = data["choices"][0]["message"]["content"]
+            
+            # 解析翻译结果
+            blocks = re.split(r'\n---\n?', result_text)
+            for i, block in enumerate(blocks):
+                if i >= len(news_items):
+                    break
+                
+                title_match = re.search(r'中文标题[：:]\s*(.+)', block)
+                desc_match = re.search(r'中文描述[：:]\s*(.+)', block)
+                insight_match = re.search(r'💡\s*(.+)', block)
+                
+                if title_match:
+                    news_items[i]["title_zh"] = title_match.group(1).strip()
+                if desc_match:
+                    news_items[i]["desc_zh"] = desc_match.group(1).strip()
+                if insight_match:
+                    news_items[i]["insight"] = insight_match.group(1).strip()
+            
+            print(f"  ✓ 新闻翻译完成（{len(blocks)} 条）")
+            return news_items
+            
+        except Exception as e:
+            if attempt < max_retries:
+                wait = 5 * (attempt + 1)
+                print(f"  [WARN] 新闻翻译失败，{wait}s 后重试: {e}")
+                time.sleep(wait)
+            else:
+                print(f"  [ERROR] 新闻翻译最终失败: {e}")
+                return news_items
+    
+    return news_items
+
+
 def format_news_report(news, max_items=5):
-    """格式化热点新闻报告"""
+    """格式化热点新闻报告（含中文翻译）"""
     if not news:
         return "今日暂无重大 AI 热点。"
     
@@ -269,16 +367,40 @@ def format_news_report(news, max_items=5):
     scored = [(score_news(item), item) for item in news]
     scored.sort(key=lambda x: -x[0])
     
+    top_news = [item for _, item in scored[:max_items]]
+    
+    # 用 Kimi 批量翻译
+    if KIMI_API_KEY:
+        print("  → 调用 Kimi 翻译新闻...")
+        top_news = translate_news_batch(top_news)
+    
     lines = []
-    for i, (score, item) in enumerate(scored[:max_items], 1):
+    for i, item in enumerate(top_news, 1):
         title = item.get("title", "")
+        title_zh = item.get("title_zh", "")
         desc = item.get("description", "")
+        desc_zh = item.get("desc_zh", "")
+        insight = item.get("insight", "")
         link = item.get("link", "")
         source = item.get("source", "")
         
-        lines.append(f"**{i}. {title}**")
-        if desc:
+        # 中文标题优先，英文标题作为副标题
+        if title_zh:
+            lines.append(f"**{i}. {title_zh}**")
+            lines.append(f"- *原文：{title}*")
+        else:
+            lines.append(f"**{i}. {title}**")
+        
+        # 中文描述优先
+        if desc_zh:
+            lines.append(f"- {desc_zh}")
+        elif desc:
             lines.append(f"- {desc[:200]}")
+        
+        # 行业影响点评
+        if insight:
+            lines.append(f"- 💡 {insight}")
+        
         if link:
             lines.append(f"- 🔗 {link}")
         if source:
