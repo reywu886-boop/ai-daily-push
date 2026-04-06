@@ -9,7 +9,7 @@ on:
 jobs:
   daily-push:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -34,6 +34,8 @@ jobs:
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           # 可选：Serper API Key（增强新闻搜索）
           SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          # Kimi API Key（用于论文深度解读）
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
         run: python main.py
 
       - name: Upload report as artifact
