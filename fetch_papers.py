@@ -1,6 +1,7 @@
 """
 AI 日报 - 论文抓取模块
 从 Hugging Face Daily Papers 和 Papers With Code 抓取当日最新论文
+支持中文翻译 + 产品经理视角解读
 """
 
 import requests
@@ -11,6 +12,8 @@ import re
 import time
 import sys
 import io
+import hashlib
+import urllib.parse
 
 # 修复 Windows 终端编码
 if sys.stdout.encoding != 'utf-8':
@@ -295,6 +298,139 @@ def classify_paper(paper):
     return "📄 其他方向"
 
 
+def translate_to_chinese(text, max_retries=2):
+    """使用 Google Translate 免费接口翻译英文到中文"""
+    if not text or len(text.strip()) < 5:
+        return text
+    
+    # 截断过长文本
+    if len(text) > 3000:
+        text = text[:3000] + "..."
+    
+    for attempt in range(max_retries + 1):
+        try:
+            url = "https://translate.googleapis.com/translate_a/single"
+            params = {
+                "client": "gtx",
+                "sl": "en",
+                "tl": "zh-CN",
+                "dt": "t",
+                "q": text,
+            }
+            resp = requests.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            result = resp.json()
+            # 拼接翻译结果
+            translated = "".join(item[0] for item in result[0] if item[0])
+            return translated
+        except Exception as e:
+            if attempt < max_retries:
+                time.sleep(1)
+            else:
+                print(f"[WARN] 翻译失败: {e}")
+                return None
+    return None
+
+
+def generate_pm_insight(paper):
+    """
+    为 AI 产品经理生成论文核心解读
+    基于论文标题、摘要、分类等信息，用通俗语言解释：
+    1. 这篇论文解决了什么问题
+    2. 核心方法/思路是什么
+    3. 对产品/行业有什么启示
+    """
+    title = paper.get("title", "").lower()
+    abstract = paper.get("abstract", "")
+    abstract_lower = abstract.lower()
+    categories = paper.get("categories", [])
+    
+    # ---- 提取关键信号 ----
+    signals = []
+    
+    # 问题类型识别
+    problem_patterns = {
+        "benchmark|evaluat|assessment": "提出了新的评测基准",
+        "generat|synthes|creat": "关于内容生成技术",
+        "edit|manipulat|transform": "关于内容编辑/操控技术",
+        "understand|recogni|detect|perceiv": "关于AI理解/识别能力",
+        "accelerat|efficien|fast|compress|lightweight": "关于提升模型效率",
+        "safe|align|bias|toxic|hallucin": "关于AI安全与可靠性",
+        "agent|tool.use|planning|reasoning": "关于AI Agent自主能力",
+        "retriev|rag|knowledge|ground": "关于知识检索增强",
+        "train|fine.tun|pretrain|reinforc": "关于模型训练方法",
+        "multi.modal|vision.language|cross.modal": "关于多模态能力",
+        "video|temporal|motion|dynamic": "关于视频/动态内容",
+        "3d|spatial|scene|reconstruct|nerf|gaussian": "关于3D/空间理解",
+        "diffusion|denois|score.match": "基于扩散模型技术",
+        "robot|embod|navigation|manipulat": "关于具身智能/机器人",
+    }
+    
+    for pattern, desc in problem_patterns.items():
+        if re.search(pattern, title + " " + abstract_lower):
+            signals.append(desc)
+    
+    # ---- 构建解读 ----
+    insight_parts = []
+    
+    # 解决什么问题
+    if abstract:
+        # 提取第一句作为问题描述
+        first_sentences = re.split(r'(?<=[.!?])\s+', abstract)
+        if first_sentences:
+            problem_sentence = first_sentences[0]
+            insight_parts.append(f"**解决的问题**：{problem_sentence}")
+    
+    # 核心思路（从摘要中提取 "we propose/introduce/present" 后面的内容）
+    approach_patterns = [
+        r'[Ww]e (?:propose|introduce|present|develop|design)\s+(.{30,200}?)(?:\.|,\s*which)',
+        r'[Tt]his (?:paper|work|study) (?:proposes|introduces|presents)\s+(.{30,200}?)(?:\.|,\s*which)',
+        r'[Oo]ur (?:method|approach|framework|system|model),?\s+(?:called|named|dubbed)?\s*\w*,?\s*(.{30,200}?)(?:\.|,\s*which)',
+    ]
+    
+    approach_found = False
+    for pat in approach_patterns:
+        match = re.search(pat, abstract)
+        if match:
+            insight_parts.append(f"**核心思路**：{match.group(1).strip()}")
+            approach_found = True
+            break
+    
+    if not approach_found and len(signals) > 0:
+        insight_parts.append(f"**技术方向**：{'; '.join(signals[:3])}")
+    
+    # 产品启示
+    pm_angles = []
+    
+    if any(kw in abstract_lower for kw in ["video generat", "video edit", "video diffus"]):
+        pm_angles.append("视频生成/编辑类产品可关注此方向的技术进展，评估是否可用于自动化视频制作流程")
+    if any(kw in abstract_lower for kw in ["multimodal", "vision-language", "image-text"]):
+        pm_angles.append("多模态技术的突破意味着产品可以更好地理解图文混合内容，提升搜索、推荐和内容审核能力")
+    if any(kw in abstract_lower for kw in ["agent", "tool use", "planning"]):
+        pm_angles.append("Agent 能力的增强意味着 AI 助手可以完成更复杂的多步骤任务，减少人工干预")
+    if any(kw in abstract_lower for kw in ["efficien", "fast", "lightweight", "compress"]):
+        pm_angles.append("效率提升意味着更低的推理成本和更快的响应速度，有助于降低产品运营成本")
+    if any(kw in abstract_lower for kw in ["safe", "alignment", "hallucin", "bias"]):
+        pm_angles.append("安全与对齐研究直接关系到产品的可靠性和合规性，是落地应用的关键保障")
+    if any(kw in abstract_lower for kw in ["benchmark", "evaluat"]):
+        pm_angles.append("新的评测基准有助于选型时量化比较不同模型的能力，为技术选型提供依据")
+    if any(kw in abstract_lower for kw in ["rag", "retriev", "knowledge"]):
+        pm_angles.append("检索增强技术可直接应用于知识库问答、文档分析等企业级 AI 产品")
+    if any(kw in abstract_lower for kw in ["3d", "gaussian", "nerf", "scene"]):
+        pm_angles.append("3D 技术进展可关注在数字人、虚拟场景、游戏内容自动生成等方向的产品化机会")
+    if any(kw in abstract_lower for kw in ["robot", "embod", "navigation"]):
+        pm_angles.append("具身智能研究推动机器人从实验室走向产品化，关注人机交互和场景适配")
+    if any(kw in abstract_lower for kw in ["diffusion", "image generat"]):
+        pm_angles.append("图像生成技术持续迭代，关注生成质量、可控性和商业化落地场景")
+    
+    if not pm_angles:
+        pm_angles.append("该研究展示了 AI 前沿技术的新进展，可持续关注其后续开源和应用落地情况")
+    
+    insight_parts.append(f"**产品启示**：{pm_angles[0]}")
+    
+    return "\n".join(insight_parts)
+
+
 def format_papers_report(papers, max_papers=10):
     """格式化论文报告"""
     if not papers:
@@ -322,6 +458,8 @@ def format_papers_report(papers, max_papers=10):
     lines = []
     idx = 1
     
+    print("  → 开始翻译论文标题和摘要...")
+    
     for cat in priority:
         if cat not in categorized:
             continue
@@ -338,7 +476,13 @@ def format_papers_report(papers, max_papers=10):
             likes = p.get("likes", 0)
             arxiv_id = p.get("arxiv_id", "")
             
-            lines.append(f"**{idx}. {title}**")
+            # 翻译标题
+            title_zh = translate_to_chinese(title)
+            if title_zh and title_zh != title:
+                lines.append(f"**{idx}. {title}**")
+                lines.append(f"**📌 {title_zh}**")
+            else:
+                lines.append(f"**{idx}. {title}**")
             
             author_line = f"- **作者**：{authors}"
             if institutions:
@@ -346,12 +490,26 @@ def format_papers_report(papers, max_papers=10):
             lines.append(author_line)
             
             if abstract:
-                # 取前两句作为核心内容
+                # 英文摘要（取前3句）
                 sentences = re.split(r'(?<=[.!?])\s+', abstract)
-                summary = " ".join(sentences[:3])
-                if len(summary) > 300:
-                    summary = summary[:300] + "..."
-                lines.append(f"- **摘要**：{summary}")
+                summary_en = " ".join(sentences[:3])
+                if len(summary_en) > 400:
+                    summary_en = summary_en[:400] + "..."
+                lines.append(f"- **摘要**：{summary_en}")
+                
+                # 中文翻译摘要
+                abstract_zh = translate_to_chinese(summary_en)
+                if abstract_zh:
+                    lines.append(f"- **中文摘要**：{abstract_zh}")
+                
+                time.sleep(0.5)  # 翻译 API 间隔
+            
+            # 产品经理解读
+            pm_insight = generate_pm_insight(p)
+            if pm_insight:
+                lines.append(f"- 💡 **PM 解读**：")
+                for insight_line in pm_insight.split("\n"):
+                    lines.append(f"  - {insight_line}")
             
             if link:
                 lines.append(f"- **链接**：{link}")
@@ -363,6 +521,7 @@ def format_papers_report(papers, max_papers=10):
             
             lines.append("")
             idx += 1
+            print(f"    ✓ 论文 {idx-1} 翻译+解读完成")
     
     return "\n".join(lines)
 
